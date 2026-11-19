@@ -24,6 +24,10 @@
 				"Linux",
 				"Android"
 			]
+		},
+		{
+			"Name": "PhysicsToolsets",
+			"Enabled": true
 		}
 	],
 	"TargetPlatforms": [
