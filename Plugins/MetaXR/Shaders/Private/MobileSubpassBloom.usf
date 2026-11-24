@@ -1,0 +1,258 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+// Every texture is an array; DispatchThreadId.z selects the eye slice.
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2DArray SrcTexture;
+SamplerState SrcSampler;
+RWTexture2DArray<float4> DstTexture;
+float2 SrcSizeInverse;
+float2 DstSize;
+float Threshold;
+float Softness;
+uint bFastDownsample;
+
+float SoftKnee(float Luma, float Threshold, float Softness)
+{
+    float Knee = Softness * Threshold;
+    float Soft = Luma - Threshold + Knee;
+    Soft = clamp(Soft, 0.0, 2.0 * Knee);
+    Soft = Soft * Soft / (4.0 * Knee + 1e-4);
+    float Hard = max(Luma - Threshold, 0.0);
+    return max(Hard, Soft) / max(Luma, 1e-4);
+}
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void BrightnessExtractCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (any(float2(DispatchThreadId.xy) >= DstSize)) { return; }
+
+    const uint Slice = DispatchThreadId.z;
+    float2 UV = (float2(DispatchThreadId.xy) + 0.5) / DstSize;
+
+	// Source may be HDR PowerMap or composited LDR; output remains R11G11B10.
+    float3 C;
+    if (bFastDownsample)
+    {
+        C = SrcTexture.SampleLevel(SrcSampler, float3(UV, Slice), 0).rgb;
+    }
+    else
+    {
+        float2 Off = SrcSizeInverse * 0.5;
+        float3 C0 = SrcTexture.SampleLevel(SrcSampler, float3(UV + float2(-Off.x, -Off.y), Slice), 0).rgb;
+        float3 C1 = SrcTexture.SampleLevel(SrcSampler, float3(UV + float2( Off.x, -Off.y), Slice), 0).rgb;
+        float3 C2 = SrcTexture.SampleLevel(SrcSampler, float3(UV + float2(-Off.x,  Off.y), Slice), 0).rgb;
+        float3 C3 = SrcTexture.SampleLevel(SrcSampler, float3(UV + float2( Off.x,  Off.y), Slice), 0).rgb;
+        C = (C0 + C1 + C2 + C3) * 0.25;
+    }
+    float Luma = dot(C, float3(0.2126, 0.7152, 0.0722));
+    float Mask = SoftKnee(Luma, Threshold, Softness);
+    float3 Extracted = C * Mask;
+    DstTexture[uint3(DispatchThreadId.xy, Slice)] = float4(Extracted, 1.0);
+}
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void DualFilterDownCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (any(float2(DispatchThreadId.xy) >= DstSize)) { return; }
+
+    const uint Slice = DispatchThreadId.z;
+    float2 UV = (float2(DispatchThreadId.xy) + 0.5) / DstSize;
+    float3 Result;
+    if (bFastDownsample)
+    {
+        Result = SrcTexture.SampleLevel(SrcSampler, float3(UV, Slice), 0).rgb;
+    }
+    else
+    {
+        float2 HalfSrcInv = SrcSizeInverse * 0.5;
+        float3 S0 = SrcTexture.SampleLevel(SrcSampler, float3(UV + float2(-HalfSrcInv.x, -HalfSrcInv.y), Slice), 0).rgb;
+        float3 S1 = SrcTexture.SampleLevel(SrcSampler, float3(UV + float2( HalfSrcInv.x, -HalfSrcInv.y), Slice), 0).rgb;
+        float3 S2 = SrcTexture.SampleLevel(SrcSampler, float3(UV + float2(-HalfSrcInv.x,  HalfSrcInv.y), Slice), 0).rgb;
+        float3 S3 = SrcTexture.SampleLevel(SrcSampler, float3(UV + float2( HalfSrcInv.x,  HalfSrcInv.y), Slice), 0).rgb;
+        float3 SC = SrcTexture.SampleLevel(SrcSampler, float3(UV, Slice), 0).rgb * 4.0;
+        Result = (S0 + S1 + S2 + S3 + SC) * (1.0 / 8.0);
+    }
+    DstTexture[uint3(DispatchThreadId.xy, Slice)] = float4(Result, 1.0);
+}
+
+Texture2DArray SrcLowTexture;
+Texture2DArray SrcHighTexture;
+float2 SrcLowSizeInverse;
+// Matches stock Bloom(N)Tint semantics for the higher-frequency mip.
+float3 HighTint;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void DualFilterUpCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (any(float2(DispatchThreadId.xy) >= DstSize)) { return; }
+
+    const uint Slice = DispatchThreadId.z;
+    float2 UV = (float2(DispatchThreadId.xy) + 0.5) / DstSize;
+    float2 HalfSrcInv = SrcLowSizeInverse * 0.5;
+	float3 S0 = SrcLowTexture.SampleLevel(SrcSampler, float3(UV + float2( 0.0,           -HalfSrcInv.y * 2.0), Slice), 0).rgb;
+    float3 S1 = SrcLowTexture.SampleLevel(SrcSampler, float3(UV + float2( HalfSrcInv.x * 2.0, 0.0),            Slice), 0).rgb;
+    float3 S2 = SrcLowTexture.SampleLevel(SrcSampler, float3(UV + float2( 0.0,            HalfSrcInv.y * 2.0), Slice), 0).rgb;
+    float3 S3 = SrcLowTexture.SampleLevel(SrcSampler, float3(UV + float2(-HalfSrcInv.x * 2.0, 0.0),            Slice), 0).rgb;
+    float3 D0 = SrcLowTexture.SampleLevel(SrcSampler, float3(UV + float2(-HalfSrcInv.x,  -HalfSrcInv.y),       Slice), 0).rgb;
+    float3 D1 = SrcLowTexture.SampleLevel(SrcSampler, float3(UV + float2( HalfSrcInv.x,  -HalfSrcInv.y),       Slice), 0).rgb;
+    float3 D2 = SrcLowTexture.SampleLevel(SrcSampler, float3(UV + float2( HalfSrcInv.x,   HalfSrcInv.y),       Slice), 0).rgb;
+    float3 D3 = SrcLowTexture.SampleLevel(SrcSampler, float3(UV + float2(-HalfSrcInv.x,   HalfSrcInv.y),       Slice), 0).rgb;
+	float3 Up = (S0 + S1 + S2 + S3) * (1.0 / 12.0) + (D0 + D1 + D2 + D3) * (2.0 / 12.0);
+
+	float3 High = SrcHighTexture.SampleLevel(SrcSampler, float3(UV, Slice), 0).rgb;
+    DstTexture[uint3(DispatchThreadId.xy, Slice)] = float4(Up + High * HighTint, 1.0);
+}
+
+Texture2DArray PrevBloomTexture;
+Texture2DArray PrevFrameDepthTexture;
+Texture2DArray MotionVectorTexture;
+SamplerState BilinearClampSampler;
+// Point sampling avoids reverse-Z interpolation that creates stereo-disparate
+// bright rings along silhouettes.
+SamplerState DepthPointSampler;
+int ReprojectionMode;
+uint bHasMotionVectors;
+uint bHasDepth;
+float EdgeFadePower;
+float2 DstSizeInverse;
+float4x4 ClipToPrevClip[2];
+
+// Fold stock sun-shaft merge into this pass; MobileLightShaft gates it and
+// linearized depth supplies the sky mask.
+int bSunMergeEnabled;
+// xy = left-eye SunCenterUV, zw = right-eye SunCenterUV
+float4 SunCenterUVLeftRight;
+// rgb = MobileLightShaft hue; a unused.
+float4 SunColor;
+// x = intensity, y = core tightness, z = halo falloff, w = halo weight.
+float4 SunProfileParams;
+// 0 = off, 1 = sky mask, 2 = sky mask * profile.
+int SunDebugMode;
+// Raw reverse-Z cannot distinguish sky from geometry without linearization.
+float4 InvDeviceZToWorldZTransform;
+
+// Mirrors Common.ush ConvertFromDeviceZ.
+float SubpassBloomLinearDepth(float DeviceZ)
+{
+    return DeviceZ * InvDeviceZToWorldZTransform.x + InvDeviceZToWorldZTransform.y
+         + 1.0 / (DeviceZ * InvDeviceZToWorldZTransform.z - InvDeviceZToWorldZTransform.w);
+}
+
+// Use the scene's linear-depth band instead of stock's hardcoded far plane.
+float2 SunSkyScaleBias;
+float SubpassBloomSkyMask(float DeviceZ)
+{
+    return saturate(SubpassBloomLinearDepth(DeviceZ) * SunSkyScaleBias.x + SunSkyScaleBias.y);
+}
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void ReprojectBloomCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (any(float2(DispatchThreadId.xy) >= DstSize)) { return; }
+
+    const uint Slice = DispatchThreadId.z;
+    float2 UV = (float2(DispatchThreadId.xy) + 0.5) * DstSizeInverse;
+    float2 PrevUV = UV;
+
+    if (ReprojectionMode >= 1)
+    {
+        BRANCH if (bHasMotionVectors)
+        {
+            float2 MV = MotionVectorTexture.SampleLevel(BilinearClampSampler, float3(UV, Slice), 0).rg;
+            PrevUV = UV + MV;
+        }
+        else
+        {
+            float2 ClipPos = UV * 2.0 - 1.0;
+            ClipPos.y = -ClipPos.y;
+            float4 PrevClip = mul(float4(ClipPos, 0.5, 1.0), ClipToPrevClip[Slice]);
+            float2 PrevNDC = PrevClip.xy / PrevClip.w;
+            PrevUV = float2(PrevNDC.x, -PrevNDC.y) * 0.5 + 0.5;
+        }
+    }
+
+	// Fade only near the reprojected frame boundary; keep the center unchanged.
+    float2 BoundaryDist = min(PrevUV, 1.0 - PrevUV);
+    float EdgeMargin = 0.02;
+    float Validity = saturate(min(BoundaryDist.x, BoundaryDist.y) / EdgeMargin);
+    Validity = pow(Validity, EdgeFadePower);
+
+    float3 PrevBloom = float3(0.0, 0.0, 0.0);
+    if (Validity > 0.0)
+    {
+        PrevBloom = PrevBloomTexture.SampleLevel(BilinearClampSampler, float3(PrevUV, Slice), 0).rgb;
+    }
+
+	// Do not depth-gate bloom history; depth only gates the sun shaft.
+
+    float3 SunShaft = float3(0.0, 0.0, 0.0);
+	// Require real depth so the black dummy cannot paint a sun.
+    if (bSunMergeEnabled != 0 && bHasDepth != 0)
+    {
+		float2 SunCenterUV = (Slice == 0) ? SunCenterUVLeftRight.xy : SunCenterUVLeftRight.zw;
+        float2 ToSun = SunCenterUV - UV;
+
+		// Six radial sky-mask taps carve occluders. Do not hard-gate the current
+		// pixel: its reduced-resolution silhouette step creates blocky halos.
+        float SkyMask = 0.0;
+        [unroll]
+        for (int t = 1; t <= 6; t++)
+        {
+            float2 TapUV = UV + ToSun * (float(t) / 7.0);
+            float TapDepth = PrevFrameDepthTexture.SampleLevel(DepthPointSampler, float3(TapUV, Slice), 0).r;
+            SkyMask += SubpassBloomSkyMask(TapDepth);
+        }
+        SkyMask *= (1.0 / 6.0);
+
+		// Aspect correction keeps the sun disc round.
+        float Aspect = DstSize.x / max(DstSize.y, 1.0);
+        float DistToSun = length(ToSun * float2(Aspect, 1.0));
+        float disc = exp(-DistToSun * DistToSun * SunProfileParams.y);
+        float halo = exp(-DistToSun * SunProfileParams.z);
+        float profile = disc + SunProfileParams.w * halo;
+
+        SunShaft = SunColor.rgb * (SunProfileParams.x * SkyMask * profile);
+
+		if (SunDebugMode != 0)
+        {
+            float dbg = (SunDebugMode == 2) ? (SkyMask * profile) : SkyMask;
+            DstTexture[uint3(DispatchThreadId.xy, Slice)] = float4(dbg.xxx * 8.0, 1.0);
+            return;
+        }
+    }
+
+    DstTexture[uint3(DispatchThreadId.xy, Slice)] = float4(PrevBloom * Validity + SunShaft, Validity);
+}
+
+// Reads depth in-pass while the resolved target is still live -- MSAA depth is
+// memoryless once the tile is gone -- and persists it for next frame's
+// pre-basepass reproject.
+Texture2DArray SrcDepthTexture;
+RWTexture2DArray<float> DstDepthTexture;
+float2 DepthDstSize;
+float2 DepthSrcSizeInverse;
+int DepthDownsampleFactor;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void DepthDownsampleCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (any(float2(DispatchThreadId.xy) >= DepthDstSize)) { return; }
+
+    const uint Slice = DispatchThreadId.z;
+    // Factor = Downsample(1..16) * ExtractDownsample(1..4), both clamped in the
+    // .cpp so the worst-case dependent-read loop stays bounded.
+    const int2 SrcBase = int2(DispatchThreadId.xy) * DepthDownsampleFactor;
+    float Nearest = 0.0;
+    [loop]
+    for (int y = 0; y < DepthDownsampleFactor; y++)
+    {
+        [loop]
+        for (int x = 0; x < DepthDownsampleFactor; x++)
+        {
+            const float2 UV = (float2(SrcBase + int2(x, y)) + 0.5) * DepthSrcSizeInverse;
+            Nearest = max(Nearest, SrcDepthTexture.SampleLevel(DepthPointSampler, float3(UV, Slice), 0).r);
+        }
+    }
+    DstDepthTexture[uint3(DispatchThreadId.xy, Slice)] = Nearest;
+}
